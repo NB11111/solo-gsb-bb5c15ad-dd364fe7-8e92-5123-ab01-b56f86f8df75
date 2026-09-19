@@ -43,6 +43,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键） |
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值 |
+| `POST` | `/merges/{merge_id}/resolution-preview` | 冲突解决预演：内存副本上校验/应用，不写库、不递增 revision |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/health` | 健康检查 |
 
@@ -110,7 +111,57 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 - 全部冲突解决后 `status` 变为 `resolved`，`result` 生成且**不可变**；此后再提交取值一律返回 `409`。
 - 对不存在的冲突指针取值返回 `400`；合并单不存在返回 `404`。
 
-### 4. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+### 4. 冲突解决预演 — `POST /merges/{merge_id}/resolution-preview`
+
+**接口地址**：`http://localhost:8000/merges/{merge_id}/resolution-preview`
+
+在正式提交前预演一批冲突取值。请求体与 `POST /resolutions` **完全一致**（同样的 `revision` 与 `resolutions` 格式，同样支持 `choice` / `value` 二选一、批量多条、删除侧语义），但只在从库中读出的**内存副本**上按顺序校验并应用：
+
+- **绝不写入 SQLite、绝不递增 revision、绝不改变状态**——可重复调用、任意试错。
+- 任一指针不存在 / 未处于开放状态、同批重复出现，或同一条**同时**给出 `choice` 和 `value`（即使 `value` 为 `null`）→ 整批返回 **`400`**，不留任何中间效果；一条取值两者都不给同样 `400`。
+- `revision` 过期 → **`409`**（响应携带 `current_revision`）；合并单已 `resolved` → **`409`**；合并单不存在 → **`404`**（均与正式提交一致）。
+- 成功时返回预演后的 `document`、`remaining_conflicts`（及计数）和 `would_resolve`（本批是否能全部解决）。
+- 若 `would_resolve` 为 `true`，额外附带从**原始 base 到预演结果**的确定性 RFC 6902 `patch` 与 `result_sha256`，与正式 resolved 后 `GET /patch` 的产物一致；尚有剩余冲突时不带这两个字段。
+
+```bash
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/resolution-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "revision": 1,
+    "resolutions": [
+      {"pointer": "/db/host", "value": "preview-host"}
+    ]
+  }'
+```
+
+该批可解决全部冲突时的响应（`revision` 仍为 1、`status` 仍为 `pending`，库中数据不变）：
+
+```json
+{
+  "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "status": "pending",
+  "revision": 1,
+  "document": {
+    "replicas": 3,
+    "image": "app:v2",
+    "db": {"host": "preview-host", "port": 5433}
+  },
+  "remaining_conflicts": [],
+  "remaining_conflict_count": 0,
+  "would_resolve": true,
+  "patch": [
+    {"op": "replace", "path": "/db/host", "value": "preview-host"},
+    {"op": "replace", "path": "/db/port", "value": 5433},
+    {"op": "replace", "path": "/image", "value": "app:v2"},
+    {"op": "replace", "path": "/replicas", "value": 3}
+  ],
+  "result_sha256": "4a7e…（64 位十六进制）"
+}
+```
+
+部分解决的批次同样返回 `200`，但 `would_resolve` 为 `false`、不含 `patch` / `result_sha256`，且 `remaining_conflicts` 列出仍开放的冲突（与 `GET /merges/{id}` 中的冲突对象结构相同）。
+
+### 5. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
 
 合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
 
@@ -160,7 +211,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（32 项）
+python -m pytest tests/ -q                  # 运行测试（37 项）
 ```
 
 ## 项目结构

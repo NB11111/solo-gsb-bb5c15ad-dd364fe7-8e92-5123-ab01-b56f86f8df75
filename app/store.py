@@ -43,6 +43,20 @@ class InvalidResolution(Exception):
     pass
 
 
+class DuplicateConflictPointer(InvalidResolution):
+    def __init__(self, pointer: str):
+        self.pointer = pointer
+        super().__init__(f"duplicate conflict pointer {pointer!r} in batch")
+
+
+class AmbiguousResolution(InvalidResolution):
+    def __init__(self, pointer: str):
+        self.pointer = pointer
+        super().__init__(
+            f"resolution for {pointer!r} must give exactly one of 'choice' or 'value'"
+        )
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -169,30 +183,7 @@ def apply_resolutions(
 
     document = json.loads(row["document"])
     conflicts = json.loads(row["conflicts"])
-    open_conflicts = {c["pointer"]: c for c in conflicts}
-
-    for item in resolutions:
-        pointer = item["pointer"]
-        conflict = open_conflicts.pop(pointer, None)
-        if conflict is None:
-            raise UnknownConflictPointer(pointer)
-        tokens = parse_pointer(pointer)
-
-        if item.get("choice") is not None:
-            side = item["choice"]
-            if side in conflict["missing"]:
-                # Chosen side deleted the key: honour the deletion.
-                document = delete_at(document, tokens)
-            else:
-                document = set_at(document, tokens, conflict[side])
-        elif item.get("value_provided"):
-            document = set_at(document, tokens, item["value"])
-        else:
-            raise InvalidResolution(
-                f"resolution for {pointer!r} needs 'choice' or 'value'"
-            )
-
-    remaining = [c for c in conflicts if c["pointer"] in open_conflicts]
+    document, remaining = _apply_resolution_batch(document, conflicts, resolutions)
     resolved = not remaining
     db.execute(
         """
@@ -212,3 +203,100 @@ def apply_resolutions(
         ),
     )
     return get_merge(merge_id)
+
+
+def preview_resolutions(
+    merge_id: str, expected_revision: int, resolutions: list[dict]
+) -> dict:
+    """Validate and apply a batch on an in-memory copy only.
+
+    Nothing is persisted: the revision is never bumped and the status does
+    not change. Revision staleness and an already-final merge still raise
+    the same 409s as the real submission. When the batch would resolve
+    every remaining conflict, the preview also carries the deterministic
+    base -> previewed-result patch and its result digest.
+    """
+    row = db.query_one(
+        "SELECT status, revision, base_doc, document, conflicts FROM merges"
+        " WHERE id = ?",
+        (merge_id,),
+    )
+    if row is None:
+        raise MergeNotFound(merge_id)
+    # 409 checks precede batch validation, exactly as for a real submission.
+    if row["status"] == STATUS_RESOLVED:
+        raise AlreadyResolved(merge_id)
+    if row["revision"] != expected_revision:
+        raise StaleRevision(row["revision"])
+
+    # Fresh copies decoded from JSON: mutating them cannot touch the row.
+    document = json.loads(row["document"])
+    conflicts = json.loads(row["conflicts"])
+    base = json.loads(row["base_doc"])
+    document, remaining = _apply_resolution_batch(
+        document, conflicts, resolutions, reject_both=True
+    )
+
+    would_resolve = not remaining
+    preview: dict[str, Any] = {
+        "merge_id": merge_id,
+        "status": row["status"],
+        "revision": row["revision"],
+        "document": document,
+        "remaining_conflicts": remaining,
+        "remaining_conflict_count": len(remaining),
+        "would_resolve": would_resolve,
+    }
+    if would_resolve:
+        # document is now the complete, placeholder-free merged result.
+        preview["patch"] = generate_patch(base, document)
+        preview["result_sha256"] = sha256_hex(document)
+    return preview
+
+
+def _apply_resolution_batch(
+    document: Any,
+    conflicts: list[dict],
+    resolutions: list[dict],
+    reject_both: bool = False,
+) -> tuple[Any, list[dict]]:
+    """Apply resolutions against an open-conflict map, in request order.
+
+    The whole batch is validated before the caller persists anything:
+    an unknown or repeated pointer, an item giving both ``choice`` and
+    ``value`` (when ``reject_both``) or an item giving neither raises and
+    leaves the document unmodified.
+    """
+    open_conflicts = {c["pointer"]: c for c in conflicts}
+
+    for item in resolutions:
+        pointer = item["pointer"]
+        conflict = open_conflicts.pop(pointer, None)
+        if conflict is None:
+            # Either the pointer never named an open conflict, or a
+            # previous item in this same batch already consumed it.
+            if any(c["pointer"] == pointer for c in conflicts):
+                raise DuplicateConflictPointer(pointer)
+            raise UnknownConflictPointer(pointer)
+        tokens = parse_pointer(pointer)
+
+        choice = item.get("choice")
+        value_provided = item.get("value_provided")
+        if reject_both and choice is not None and value_provided:
+            raise AmbiguousResolution(pointer)
+
+        if choice is not None:
+            if choice in conflict["missing"]:
+                # Chosen side deleted the key: honour the deletion.
+                document = delete_at(document, tokens)
+            else:
+                document = set_at(document, tokens, conflict[choice])
+        elif value_provided:
+            document = set_at(document, tokens, item["value"])
+        else:
+            raise InvalidResolution(
+                f"resolution for {pointer!r} needs 'choice' or 'value'"
+            )
+
+    remaining = [c for c in conflicts if c["pointer"] in open_conflicts]
+    return document, remaining

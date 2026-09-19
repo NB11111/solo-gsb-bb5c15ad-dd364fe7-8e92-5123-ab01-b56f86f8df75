@@ -128,3 +128,28 @@ def resolve_merge(merge_id: str, body: ResolveRequest):
         for r in body.resolutions
     ]
     return store.apply_resolutions(merge_id, body.revision, items)
+
+
+@app.post("/merges/{merge_id}/resolution-preview")
+def preview_resolutions(merge_id: str, body: ResolveRequest):
+    """Dry-run a resolution batch on an in-memory copy of the merge.
+
+    Uses the same revision/resolutions payload as a real submission but
+    never writes SQLite, never bumps the revision and never changes the
+    status. Stale revision (409) and already-resolved merge (409) are
+    enforced the same way; an invalid, repeated or otherwise malformed
+    batch fails wholesale with 400. On success the response shows the
+    previewed document and remaining conflicts; if the batch would clear
+    every conflict it additionally carries the base -> result patch and
+    the result SHA-256.
+    """
+    items = [
+        {
+            "pointer": r.pointer,
+            "choice": r.choice,
+            "value": r.value,
+            "value_provided": r.value_provided,
+        }
+        for r in body.resolutions
+    ]
+    return store.preview_resolutions(merge_id, body.revision, items)
