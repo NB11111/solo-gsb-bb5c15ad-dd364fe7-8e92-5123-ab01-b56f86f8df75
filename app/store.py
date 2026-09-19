@@ -151,26 +151,17 @@ def create_merge(
     return get_merge(merge_id), True
 
 
-def apply_resolutions(
-    merge_id: str, expected_revision: int, resolutions: list[dict]
-) -> dict:
-    """Apply a batch of conflict resolutions.
+def _apply_batch(
+    document: Any, conflicts: list[dict], resolutions: list[dict]
+) -> tuple[Any, list[dict]]:
+    """Validate and apply a batch of resolutions in memory.
 
-    Raises StaleRevision (409) if expected_revision does not match the
-    current revision, and AlreadyResolved (409) once the result is final.
+    Returns (document, remaining_conflicts). Pure: the caller decides
+    whether the outcome is persisted (apply_resolutions) or discarded
+    (preview_resolutions). A repeated pointer fails because the first
+    occurrence closes the conflict.
     """
-    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
-    if row is None:
-        raise MergeNotFound(merge_id)
-    if row["status"] == STATUS_RESOLVED:
-        raise AlreadyResolved(merge_id)
-    if row["revision"] != expected_revision:
-        raise StaleRevision(row["revision"])
-
-    document = json.loads(row["document"])
-    conflicts = json.loads(row["conflicts"])
     open_conflicts = {c["pointer"]: c for c in conflicts}
-
     for item in resolutions:
         pointer = item["pointer"]
         conflict = open_conflicts.pop(pointer, None)
@@ -193,6 +184,28 @@ def apply_resolutions(
             )
 
     remaining = [c for c in conflicts if c["pointer"] in open_conflicts]
+    return document, remaining
+
+
+def apply_resolutions(
+    merge_id: str, expected_revision: int, resolutions: list[dict]
+) -> dict:
+    """Apply a batch of conflict resolutions.
+
+    Raises StaleRevision (409) if expected_revision does not match the
+    current revision, and AlreadyResolved (409) once the result is final.
+    """
+    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] == STATUS_RESOLVED:
+        raise AlreadyResolved(merge_id)
+    if row["revision"] != expected_revision:
+        raise StaleRevision(row["revision"])
+
+    document, remaining = _apply_batch(
+        json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
+    )
     resolved = not remaining
     db.execute(
         """
@@ -212,3 +225,46 @@ def apply_resolutions(
         ),
     )
     return get_merge(merge_id)
+
+
+def preview_resolutions(
+    merge_id: str, expected_revision: int, resolutions: list[dict]
+) -> dict:
+    """Dry-run a resolution batch on an in-memory copy of the merge.
+
+    Same revision/status guards and per-item validation as
+    apply_resolutions, but stricter: an item carrying both 'choice' and
+    'value' is rejected. Nothing is persisted — no write, no revision
+    bump, no status change.
+    """
+    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] == STATUS_RESOLVED:
+        raise AlreadyResolved(merge_id)
+    if row["revision"] != expected_revision:
+        raise StaleRevision(row["revision"])
+
+    for item in resolutions:
+        if item.get("choice") is not None and item.get("value_provided"):
+            raise InvalidResolution(
+                f"resolution for {item['pointer']!r} gives both 'choice' and 'value'"
+            )
+
+    document, remaining = _apply_batch(
+        json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
+    )
+    would_resolve = not remaining
+    preview = {
+        "merge_id": merge_id,
+        "revision": row["revision"],
+        "document": document,
+        "remaining_conflicts": remaining,
+        "would_resolve": would_resolve,
+    }
+    if would_resolve:
+        # Same deterministic patch/digest the resolved merge would yield.
+        base = json.loads(row["base_doc"])
+        preview["patch"] = generate_patch(base, document)
+        preview["result_sha256"] = sha256_hex(document)
+    return preview

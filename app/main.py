@@ -111,14 +111,8 @@ def get_merge_patch(merge_id: str):
     return store.get_merge_patch(merge_id)
 
 
-@app.post("/merges/{merge_id}/resolutions")
-def resolve_merge(merge_id: str, body: ResolveRequest):
-    """Submit a batch of conflict resolutions against the current revision.
-
-    Returns 409 on a stale revision or once the merge is resolved.
-    When the last conflict is resolved the result becomes immutable.
-    """
-    items = [
+def _resolution_items(body: ResolveRequest) -> list[dict]:
+    return [
         {
             "pointer": r.pointer,
             "choice": r.choice,
@@ -127,4 +121,27 @@ def resolve_merge(merge_id: str, body: ResolveRequest):
         }
         for r in body.resolutions
     ]
-    return store.apply_resolutions(merge_id, body.revision, items)
+
+
+@app.post("/merges/{merge_id}/resolutions")
+def resolve_merge(merge_id: str, body: ResolveRequest):
+    """Submit a batch of conflict resolutions against the current revision.
+
+    Returns 409 on a stale revision or once the merge is resolved.
+    When the last conflict is resolved the result becomes immutable.
+    """
+    return store.apply_resolutions(merge_id, body.revision, _resolution_items(body))
+
+
+@app.post("/merges/{merge_id}/resolution-preview")
+def preview_resolution(merge_id: str, body: ResolveRequest):
+    """Dry-run a resolution batch against the current revision.
+
+    Same request shape as the committing endpoint, but the batch is
+    validated and applied on an in-memory copy only: nothing is written,
+    the revision is not bumped and the status never changes. Returns the
+    would-be document and remaining conflicts; when the batch would
+    resolve everything, the deterministic base-to-result patch and its
+    SHA-256 are included.
+    """
+    return store.preview_resolutions(merge_id, body.revision, _resolution_items(body))

@@ -43,6 +43,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键） |
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值 |
+| `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/health` | 健康检查 |
 
@@ -110,7 +111,47 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 - 全部冲突解决后 `status` 变为 `resolved`，`result` 生成且**不可变**；此后再提交取值一律返回 `409`。
 - 对不存在的冲突指针取值返回 `400`；合并单不存在返回 `404`。
 
-### 4. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+### 4. 预演冲突解决 — `POST /merges/{merge_id}/resolution-preview`
+
+请求格式与正式提交（`POST /merges/{merge_id}/resolutions`）完全相同（`revision` + `resolutions`），但只在**内存副本**上按顺序校验并应用：**不写入 SQLite、不递增 revision、不改变状态**，可安全反复调用，用于在正式提交前试算取值方案。
+
+```bash
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/resolution-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "revision": 1,
+    "resolutions": [
+      {"pointer": "/db/host", "choice": "left"}
+    ]
+  }'
+```
+
+响应（预演结果，合并单本身不受影响）：
+
+```json
+{
+  "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "revision": 1,
+  "document": {
+    "replicas": 3,
+    "db": {"host": "b", "port": 5433}
+  },
+  "remaining_conflicts": [],
+  "would_resolve": true,
+  "patch": [
+    {"op": "replace", "path": "/db/host", "value": "b"},
+    {"op": "replace", "path": "/db/port", "value": 5433},
+    {"op": "replace", "path": "/replicas", "value": 3}
+  ],
+  "result_sha256": "5f4a…（64 位十六进制）"
+}
+```
+
+- `would_resolve` 为 `true`（该批次可解决全部剩余冲突）时，额外返回 `base` → 预演结果的确定性 `patch`（规则同 `GET /merges/{merge_id}/patch`）与 `result_sha256`；否则不携带这两个字段。
+- 任一指针对应的冲突不存在或已在本批中被解决（即指针重复）、或同一条目同时给出 `choice` 与 `value`（显式 `null` 也算给出 `value`）→ 整批 **`400`**，同样无任何副作用。
+- `revision` 过期、合并单已 `resolved` → 与正式提交相同的 **`409`**；合并单不存在 → **`404`**。
+
+### 5. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
 
 合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
 
@@ -160,7 +201,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（32 项）
+python -m pytest tests/ -q                  # 运行测试（36 项）
 ```
 
 ## 项目结构
